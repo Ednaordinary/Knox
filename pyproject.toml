@@ -1,0 +1,12 @@
+[project]
+name = "Knox"
+version = "0.0.1"
+description = "Auto printing bot for hack club print legion "
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "bambulabs-api>=2.6.3",
+    "cadquery>=2.5.2",
+    "slack-bolt>=1.23.0",
+    "slack-sdk>=3.36.0",
+]
