@@ -19,4 +19,5 @@ Within slack it can
 - [x] Estimate grams/ounces from a sliced file
 - [ ] Use that weight estimation to
 - [x] Calculate shipping prices
-- [ ] Send the file to the printer once approved
+- [ ] Print the file on the printer once approved
+- [x] Automatically remove prints from the bed
