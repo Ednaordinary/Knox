@@ -1,8 +1,10 @@
 import os
 import io
 import zipfile
+import requests
 import traceback
 import time
+import cadquery as cq
 from slack_bolt.async_app import AsyncApp
 from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
 from dotenv import load_dotenv
@@ -11,6 +13,8 @@ import re
 
 from usps import get_price
 from printer import Printer
+from counter import Counter
+from slicer import Slicer
 
 load_dotenv()
 
@@ -22,11 +26,14 @@ APP_TOKEN = os.environ.get("APP_TOKEN")
 
 app = AsyncApp(token=SLACK_TOKEN)
 printer = Printer(IP, ACCESS_CODE, SERIAL)
+print_counter = Counter("count.bin")
+slicer = Slicer()
 
 
 @app.event("message")
 async def handle_message_events(ack, body, logger):
     await ack()
+    print(body)
     if 'event' in body and 'user' in body['event'] and body['event']['user'] != os.environ.get("OWNER"):
         return
     if 'event' in body and 'text' in body['event']:
@@ -47,6 +54,10 @@ async def handle_message_events(ack, body, logger):
             stack.append(cam(body))
         if "print price " in cmd:
             await price(body)
+        if "print slice" in cmd:
+            await print_slice(body)
+        if "print flow" in cmd:
+            await print_slice(body, flow=True)
         if len(stack) > 0:
             printer.alloc()
             for i in stack:
@@ -64,6 +75,15 @@ def create_zip_archive_in_memory(
 
 def thread_ts_func(body):
     return body['event']['thread_ts'] if 'thread_ts' in body['event'] else body['event']['ts']
+
+async def get_message(channel, ts):
+    result = await app.client.conversations_history(
+        channel=channel,
+        inclusive=True,
+        oldest=ts,
+        limit=1,
+    )
+    return result["messages"][0]
 
 def is_valid_gcode(line: str):
     # Remove whitespace and comments
@@ -115,6 +135,85 @@ async def price(body):
     if price is None:
         price = "death"
     await app.client.chat_postMessage(channel=body['event']['channel'], text="price: $" + str(price), thread_ts=thread_ts)
+
+async def print_slice(body, flow=None):
+    thread_ts = thread_ts_func(body)
+    print_counter.inc()
+    print_id = print_counter.get()
+    if 'thread_ts' in body['event']:
+        message = await get_message(body['event']['channel'], body['event']['thread_ts'])
+    else:
+        message = body['event']
+    if 'files' not in message:
+        await app.client.chat_postMessage(channel=body['event']['channel'], text="nothing to slice !!", thread_ts=thread_ts)
+        return
+    headers = {
+        "Authorization": "Bearer " + SLACK_TOKEN
+    }
+    files = []
+    prefix = "prints/" + str(print_id)
+    export_path = prefix + "/export"
+    os.makedirs(export_path, exist_ok=True)
+    for idx, file in enumerate(message['files']):
+        if file['title'].lower().endswith('.stl'):
+            with requests.get(file['url_private'], headers=headers) as content:
+                path = prefix + "/" + str(idx) + ".stl"
+                with open(path, 'wb') as disk_file:
+                    disk_file.write(content.content)
+                files.append(path)
+        elif file['title'].lower().endswith('.step'):
+            with requests.get(file['url_private'], headers=headers) as content:
+                path = prefix + "/" + str(idx) + ".step"
+                with open(path, 'wb') as disk_file:
+                    disk_file.write(content.content)
+                try:
+                    step = cq.importers.importStep(path)
+                    path = prefix + "/" + str(idx) + ".stl"
+                    cq.exporters.export(step, path)
+                except:
+                    await app.client.chat_postMessage(channel=body['event']['channel'], text="failed to steal step file (" + str(idx) + ")", thread_ts=thread_ts)
+                else:
+                    files.append(path)
+    validate = [prefix + "/" + x for x in os.listdir(prefix) if x.endswith(".stl")]
+    for file in files:
+        if file not in validate:
+            name = message['files'][int(file.split("/")[-1][:-4])]['name']
+            await app.client.chat_postMessage(channel=body['event']['channel'], text="could not convert step: " + name, thread_ts=thread_ts)
+    slicer.slice(validate, export_path)
+    gcode = [export_path + "/" + x for x in os.listdir(export_path) if x.endswith(".gcode")]
+    plates = []
+    for g in gcode:
+        filament, time = slicer.get_grams(g)
+        plates.append((filament, time))
+    if len(plates) == 0:
+        plates_response = "i dropped the print"
+    elif len(plates) == 1:
+        plates_response = plates[0][1] + ", *" + str(round(plates[0][0], 2)) + "g*"
+    else:
+        plates_response = "\n".join([f"Plate {str(idx)}: {x[1]} ({round(x[0], 2)}g)" for idx, x in enumerate(plates)])
+        plates_response += "\nTotal: *" + str(round(sum([x[0] for x in plates]), 2)) + "g*"
+    await app.client.chat_postMessage(channel=body['event']['channel'], text=plates_response, thread_ts=thread_ts)
+    if flow and len(plates) != 0:
+        args = body['event']['text'].split(" ")
+        args = [x.strip() for x in args if (x.strip() != "print" and x.strip() != "flow")]
+        try:
+            int(args[0]) # validate its a number, but keep leading zeros
+            zip_code = args[0]
+            weight = sum([x[0] for x in plates]) / 28.35 # grams -> ounces
+            weight = weight / 16 # ounces -> pounds
+        except:
+            await app.client.chat_postMessage(channel=body['event']['channel'], text="failed to parse! birds cant read", thread_ts=thread_ts)
+            print(traceback.format_exc())
+            return
+        try:
+            price = get_price(zip_code, weight)
+        except:
+            await app.client.chat_postMessage(channel=body['event']['channel'], text="a drone hit me and i died", thread_ts=thread_ts)
+            print(traceback.format_exc())
+            return
+        if price is None:
+            price = "death"
+        await app.client.chat_postMessage(channel=body['event']['channel'], text="price: $" + str(price), thread_ts=thread_ts)
 
 async def home(body):
     thread_ts = thread_ts_func(body)
