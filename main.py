@@ -1,0 +1,174 @@
+import os
+import io
+import zipfile
+import traceback
+import time
+from slack_bolt.async_app import AsyncApp
+from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
+from dotenv import load_dotenv
+
+import re
+
+from usps import get_price
+from printer import Printer
+
+load_dotenv()
+
+IP = os.environ.get("BAMBU_IP")
+SERIAL = os.environ.get("BAMBU_SN")
+ACCESS_CODE = os.environ.get("BAMBU_ACCESS")
+SLACK_TOKEN = os.environ.get("SLACK_TOKEN")
+APP_TOKEN = os.environ.get("APP_TOKEN")
+
+app = AsyncApp(token=SLACK_TOKEN)
+printer = Printer(IP, ACCESS_CODE, SERIAL)
+
+
+@app.event("message")
+async def handle_message_events(ack, body, logger):
+    await ack()
+    if 'event' in body and 'user' in body['event'] and body['event']['user'] != os.environ.get("OWNER"):
+        return
+    if 'event' in body and 'text' in body['event']:
+        cmd = body['event']['text']
+        stack = []
+        if "print camera" in cmd:
+            stack.append(cam(body))
+        if "print home" in cmd:
+            stack.append(home(body))
+            stack.append(cam(body))
+        if "print rem" in cmd:
+            stack.append(rem(body))
+            stack.append(cam(body))
+        if "print stop" in cmd or "print off" in cmd:
+            stack.append(off(body))
+        if "cmd" in cmd:
+            stack.append(gcode(body))
+            stack.append(cam(body))
+        if "print price " in cmd:
+            await price(body)
+        if len(stack) > 0:
+            printer.alloc()
+            for i in stack:
+                await i
+            printer.dealloc()
+
+def create_zip_archive_in_memory(
+        text_content: str,
+        text_file_name: str = 'file.txt'):
+    zip_buffer = io.BytesIO()
+    with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zipf:
+        zipf.writestr(text_file_name, text_content)
+    zip_buffer.seek(0)
+    return zip_buffer
+
+def thread_ts_func(body):
+    return body['event']['thread_ts'] if 'thread_ts' in body['event'] else body['event']['ts']
+
+def is_valid_gcode(line: str):
+    # Remove whitespace and comments
+    line = line.split(";")[0].strip()
+
+    # Check if line is empty or starts with a valid G-code command (G or M)
+    if not line or not re.match(r"^[GM]\d+", line):
+        print("does not start with G or M")
+        return False
+
+    # Check for proper parameter formatting
+    tokens = line.split()
+    for token in tokens[1:]:
+        if not re.match(r"^[A-Z]-?\d+(\.\d+)?$", token):
+            print("token does not match:", token)
+            return False
+
+    return True
+
+def check_gcode(gcode):
+    for idx, line in enumerate(gcode.split("\n")):
+        if line.split(";")[0].strip() == "":
+            continue
+        if not is_valid_gcode(line):
+            return (False, idx)
+    return (True, 0)
+
+async def price(body):
+    thread_ts = thread_ts_func(body)
+    args = body['event']['text'].split(" ")
+    args = [x.strip() for x in args if (x.strip() != "price" and x.strip() != "print")]
+    try:
+        int(args[0]) # validate its a number, but keep leading zeros
+        zip_code = args[0]
+        if len(args) >= 2:
+            weight = float(args[1]) / 16
+        else:
+            weight = 3.0 / 16
+    except:
+        await app.client.chat_postMessage(channel=body['event']['channel'], text="failed to parse! birds cant read", thread_ts=thread_ts)
+        print(traceback.format_exc())
+        return
+    try:
+        price = get_price(zip_code, weight)
+    except:
+        await app.client.chat_postMessage(channel=body['event']['channel'], text="a drone hit me and i died", thread_ts=thread_ts)
+        print(traceback.format_exc())
+        return
+    if price is None:
+        price = "death"
+    await app.client.chat_postMessage(channel=body['event']['channel'], text="price: $" + str(price), thread_ts=thread_ts)
+
+async def home(body):
+    thread_ts = thread_ts_func(body)
+    #await app.client.chat_postMessage(channel=body['event']['channel'], text="homing printer..", thread_ts=thread_ts)
+    printer.home()
+    await app.client.chat_postMessage(channel=body['event']['channel'], text="printer homed", thread_ts=thread_ts)
+
+async def cam(body):
+    # very often will not work because of fast allocation
+    try:
+        image = printer.get_camera_image()
+    except:
+        return
+    else:
+        file = io.BytesIO()
+        image.save(file, format='PNG')
+        file.seek(0)
+        file = file.read()
+        thread_ts = thread_ts_func(body)
+        #await app.client.chat_postMessage(channel=body['event']['channel'], text=":<", thread_ts=thread_ts)
+        await app.client.files_upload_v2(channel=body['event']['channel'], thread_ts=thread_ts, file=file)
+
+async def rem(body):
+    thread_ts = thread_ts_func(body)
+    with open("rem.gcode", "r") as file:
+        gcode = file.read()
+    valid = check_gcode(gcode)
+    if not valid[0]:
+        await app.client.chat_postMessage(channel=body['event']['channel'], text="gcode error on line " + str(valid[1]), thread_ts=thread_ts)
+        return
+    cmds = [x for x in gcode.split("\n") if x.split(";")[0].strip() != ""]
+    for idx, line in enumerate(cmds):
+        printer.gcode(line)
+    await app.client.chat_postMessage(channel=body['event']['channel'], text="removed print from bed", thread_ts=thread_ts)
+        
+async def gcode(body):
+    cmds = body['event']['text'].split("\n")
+    thread_ts = thread_ts_func(body)
+    for cmd in cmds:
+        gcode = cmd.replace("cmd", "").strip()
+        try:
+            printer.gcode(gcode)
+        except:
+            await app.client.chat_postMessage(channel=body['event']['channel'], text="failed to run gcode!", thread_ts=thread_ts)
+
+async def off(body):
+    thread_ts = thread_ts_func(body)
+    printer.gcode("M18 X Y Z", gcode_check=False)
+    await app.client.chat_postMessage(channel=body['event']['channel'], text="printer stopped", thread_ts=thread_ts)
+
+async def main():
+    handler = AsyncSocketModeHandler(app, APP_TOKEN)
+    await handler.start_async()
+
+if __name__ == "__main__":
+    import asyncio
+    asyncio.run(main())
