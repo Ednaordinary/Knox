@@ -14,10 +14,10 @@ It's made for the following setup:
 
 Within slack it can
 
-- [ ] Download STL and STEP files from slack on command (converting STEP files to STL automatically)
-- [ ] Slice them
+- [x] Download STL and STEP files from slack on command (converting STEP files to STL automatically)
+- [x] Slice them
 - [x] Estimate grams/ounces from a sliced file
-- [ ] Use that weight estimation to
+- [x] Use that weight estimation to
 - [x] Calculate shipping prices
 - [ ] Print the file on the printer once approved
 - [x] Automatically remove prints from the bed
