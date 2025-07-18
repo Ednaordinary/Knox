@@ -1,5 +1,8 @@
 # Knox
 
+<img width="300" height="300" alt="knox-round" src="https://github.com/user-attachments/assets/7369e379-34ee-4cd4-9259-a8186f80ae14" />
+
+
 This is a bot for automatically printing [print legion](https://printlegion.hackclub.com/) 3D models.
 
 It's made for the following setup:
