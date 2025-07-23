@@ -3,6 +3,7 @@ import io
 import zipfile
 import requests
 import traceback
+import threading
 import time
 import cadquery as cq
 from slack_bolt.async_app import AsyncApp
@@ -15,6 +16,7 @@ from usps import get_price
 from printer import Printer
 from counter import Counter
 from slicer import Slicer
+import visual
 
 load_dotenv()
 
@@ -28,7 +30,7 @@ app = AsyncApp(token=SLACK_TOKEN)
 printer = Printer(IP, ACCESS_CODE, SERIAL)
 print_counter = Counter("count.bin")
 slicer = Slicer()
-
+loop = None
 
 @app.event("message")
 async def handle_message_events(ack, body, logger):
@@ -136,6 +138,21 @@ async def price(body):
         price = "death"
     await app.client.chat_postMessage(channel=body['event']['channel'], text="price: $" + str(price), thread_ts=thread_ts)
 
+def visual_runner(gcode_path):
+    save, _ = os.path.splitext(gcode_path)
+    save = save + ".mp4"
+    visual.visualize(gcode_path, save)
+    return save
+    
+def visual_thread(gcode_path, body):
+    save = visual_runner(gcode_path)
+    thread_ts = thread_ts_func(body)
+    with open(save, "rb") as video:
+        asyncio.run_coroutine_threadsafe(
+            app.client.files_upload_v2(channel=body['event']['channel'], thread_ts=thread_ts, file=video),
+            loop,
+        ).result() # dont close file reader while reading
+
 async def print_slice(body, flow=None):
     thread_ts = thread_ts_func(body)
     print_counter.inc()
@@ -157,29 +174,60 @@ async def print_slice(body, flow=None):
     for idx, file in enumerate(message['files']):
         if file['title'].lower().endswith('.stl'):
             with requests.get(file['url_private'], headers=headers) as content:
-                path = prefix + "/" + str(idx) + ".stl"
+                save_path = prefix + "/" + str(idx) + ".stl"
                 with open(path, 'wb') as disk_file:
                     disk_file.write(content.content)
-                files.append(path)
+                files.append(save_path)
         elif file['title'].lower().endswith('.step'):
             with requests.get(file['url_private'], headers=headers) as content:
-                path = prefix + "/" + str(idx) + ".step"
-                with open(path, 'wb') as disk_file:
+                save_path = prefix + "/" + str(idx) + ".step"
+                with open(save_path, 'wb') as disk_file:
                     disk_file.write(content.content)
                 try:
-                    step = cq.importers.importStep(path)
-                    path = prefix + "/" + str(idx) + ".stl"
-                    cq.exporters.export(step, path)
+                    step = cq.importers.importStep(save_path)
+                    save_path = prefix + "/" + str(idx) + ".stl"
+                    cq.exporters.export(step, save_path)
                 except:
-                    await app.client.chat_postMessage(channel=body['event']['channel'], text="failed to steal step file (" + str(idx) + ")", thread_ts=thread_ts)
+                    print(traceback.format_exc())
+                    await app.client.chat_postMessage(channel=body['event']['channel'], text="failed to steal step file" + file['name'], thread_ts=thread_ts)
                 else:
-                    files.append(path)
+                    files.append(save_path)
     validate = [prefix + "/" + x for x in os.listdir(prefix) if x.endswith(".stl")]
     for file in files:
         if file not in validate:
             name = message['files'][int(file.split("/")[-1][:-4])]['name']
             await app.client.chat_postMessage(channel=body['event']['channel'], text="could not convert step: " + name, thread_ts=thread_ts)
-    slicer.slice(validate, export_path)
+    split = []
+    for i in validate:
+        try:
+            print(validate)
+            name = message['files'][int(i.split("/")[-1][:-4])]['name']
+            mesh = trimesh.load(i)
+            #mesh.show()
+            split_mesh = mesh.split(only_watertight = False)
+            split_mesh = [m for m in split_mesh if m.faces.shape[0] > 4] # this is the minimum amount of points for a  3D object
+            #split_mesh[0].show()
+            print(split_mesh)
+            if len(split_mesh) > 1:
+                original_path, _ = os.path.splitext(i)
+                not_okay = 0
+                for idx, n in enumerate(split_mesh):
+                    if not n.is_watertight:
+                        not_okay += 1
+                    save_path = original_path + "-" + str(idx) + ".stl"
+                    n.export(save_path)
+                    split.append(save_path)
+                if not_okay > 0:
+                    await app.client.chat_postMessage(channel=body['event']['channel'], text=("an object in " if not_okay == 1 else str(not_okay) + " objects in ") + name + (" is" if not_okay == 1 else " are") + " not manifold and may not print right", thread_ts=thread_ts)
+            else:
+                if not mesh.is_watertight:
+                    await app.client.chat_postMessage(channel=body['event']['channel'], text=name + " is not manifold and may not print right", thread_ts=thread_ts)
+                split.append(i)
+        except:
+            print(traceback.format_exc())
+            await app.client.chat_postMessage(channel=body['event']['channel'], text=("part of " if len(validate) > 1 else "") + "the print blew up", thread_ts=thread_ts)
+            return
+    slicer.slice(split, export_path)
     gcode = [export_path + "/" + x for x in os.listdir(export_path) if x.endswith(".gcode")]
     plates = []
     for g in gcode:
@@ -194,6 +242,8 @@ async def print_slice(body, flow=None):
         plates_response += "\nTotal: *" + str(round(sum([x[0] for x in plates]), 2)) + "g*"
     await app.client.chat_postMessage(channel=body['event']['channel'], text=plates_response, thread_ts=thread_ts)
     if flow and len(plates) != 0:
+        for gcode_path in gcode:
+            threading.Thread(target=visual_thread, args=[gcode_path, body]).start()
         args = body['event']['text'].split(" ")
         args = [x.strip() for x in args if (x.strip() != "print" and x.strip() != "flow")]
         try:
@@ -265,6 +315,8 @@ async def off(body):
     await app.client.chat_postMessage(channel=body['event']['channel'], text="printer stopped", thread_ts=thread_ts)
 
 async def main():
+    global loop
+    loop = asyncio.get_running_loop()
     handler = AsyncSocketModeHandler(app, APP_TOKEN)
     await handler.start_async()
 
