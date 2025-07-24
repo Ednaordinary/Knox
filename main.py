@@ -4,6 +4,8 @@ import zipfile
 import requests
 import traceback
 import threading
+from multiprocessing import Process
+import trimesh
 import time
 import cadquery as cq
 from slack_bolt.async_app import AsyncApp
@@ -142,10 +144,13 @@ def visual_runner(gcode_path):
     save, _ = os.path.splitext(gcode_path)
     save = save + ".mp4"
     visual.visualize(gcode_path, save)
-    return save
     
 def visual_thread(gcode_path, body):
-    save = visual_runner(gcode_path)
+    p = Process(target=visual_runner, args=[gcode_path])
+    p.start()
+    p.join()
+    save, _ = os.path.splitext(gcode_path)
+    save = save + ".mp4"
     thread_ts = thread_ts_func(body)
     with open(save, "rb") as video:
         asyncio.run_coroutine_threadsafe(
@@ -172,13 +177,16 @@ async def print_slice(body, flow=None):
     export_path = prefix + "/export"
     os.makedirs(export_path, exist_ok=True)
     for idx, file in enumerate(message['files']):
-        if file['title'].lower().endswith('.stl'):
+        title = file['title'] if 'title' in file else file['name'] if 'name' in file else None
+        if title == None:
+            continue
+        if title.lower().endswith('.stl'):
             with requests.get(file['url_private'], headers=headers) as content:
                 save_path = prefix + "/" + str(idx) + ".stl"
-                with open(path, 'wb') as disk_file:
+                with open(save_path, 'wb') as disk_file:
                     disk_file.write(content.content)
                 files.append(save_path)
-        elif file['title'].lower().endswith('.step'):
+        elif title.lower().endswith('.step'):
             with requests.get(file['url_private'], headers=headers) as content:
                 save_path = prefix + "/" + str(idx) + ".step"
                 with open(save_path, 'wb') as disk_file:
@@ -211,14 +219,21 @@ async def print_slice(body, flow=None):
             if len(split_mesh) > 1:
                 original_path, _ = os.path.splitext(i)
                 not_okay = 0
+                surfaces = 0
                 for idx, n in enumerate(split_mesh):
                     if not n.is_watertight:
                         not_okay += 1
-                    save_path = original_path + "-" + str(idx) + ".stl"
-                    n.export(save_path)
-                    split.append(save_path)
+                    if not n.is_volume:
+                        surfaces += 1
+                    else:
+                        save_path = original_path + "-" + str(idx) + ".stl"
+                        n.export(save_path)
+                        split.append(save_path)
+                surface_print = ""
+                if surfaces > 0:
+                    surface_print = "\nadditionally, " + ("an object does" if surfaces == 1 else str(surfaces) + " objects do") + " not contain volume and will not be sliced."
                 if not_okay > 0:
-                    await app.client.chat_postMessage(channel=body['event']['channel'], text=("an object in " if not_okay == 1 else str(not_okay) + " objects in ") + name + (" is" if not_okay == 1 else " are") + " not manifold and may not print right", thread_ts=thread_ts)
+                    await app.client.chat_postMessage(channel=body['event']['channel'], text=("an object in " if not_okay == 1 else str(not_okay) + " objects in ") + name + (" is" if not_okay == 1 else " are") + " not manifold and may not print right" + surface_print, thread_ts=thread_ts)
             else:
                 if not mesh.is_watertight:
                     await app.client.chat_postMessage(channel=body['event']['channel'], text=name + " is not manifold and may not print right", thread_ts=thread_ts)
@@ -229,6 +244,11 @@ async def print_slice(body, flow=None):
             return
     slicer.slice(split, export_path)
     gcode = [export_path + "/" + x for x in os.listdir(export_path) if x.endswith(".gcode")]
+    if gcode == []: # try again with supports
+        slicer.slice(split, export_path, support=True)
+        gcode = [export_path + "/" + x for x in os.listdir(export_path) if x.endswith(".gcode")]
+    for gcode_path in gcode:
+        threading.Thread(target=visual_thread, args=[gcode_path, body]).start()
     plates = []
     for g in gcode:
         filament, time = slicer.get_grams(g)
@@ -238,12 +258,10 @@ async def print_slice(body, flow=None):
     elif len(plates) == 1:
         plates_response = plates[0][1] + ", *" + str(round(plates[0][0], 2)) + "g*"
     else:
-        plates_response = "\n".join([f"Plate {str(idx)}: {x[1]} ({round(x[0], 2)}g)" for idx, x in enumerate(plates)])
+        plates_response = "\n".join([f"Plate {str(idx + 1)}: {x[1]} ({round(x[0], 2)}g)" for idx, x in enumerate(plates)])
         plates_response += "\nTotal: *" + str(round(sum([x[0] for x in plates]), 2)) + "g*"
     await app.client.chat_postMessage(channel=body['event']['channel'], text=plates_response, thread_ts=thread_ts)
     if flow and len(plates) != 0:
-        for gcode_path in gcode:
-            threading.Thread(target=visual_thread, args=[gcode_path, body]).start()
         args = body['event']['text'].split(" ")
         args = [x.strip() for x in args if (x.strip() != "print" and x.strip() != "flow")]
         try:
