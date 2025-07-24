@@ -17,7 +17,9 @@ Within slack it can
 - [x] Download STL and STEP files from slack on command (converting STEP files to STL automatically)
 - [x] Slice them
 - [x] Estimate grams/ounces from a sliced file
-- [x] Use that weight estimation to
-- [x] Calculate shipping prices
+- [x] Calculate shipping prices using that weight estimation
 - [ ] Print the file on the printer once approved
 - [x] Automatically remove prints from the bed
+
+> [!NOTE]
+> Most of the code in this repository was made to work well on the user end but not necessarily be easily maintainable. It is a product of the times. (I am aware the code's bad lol)
